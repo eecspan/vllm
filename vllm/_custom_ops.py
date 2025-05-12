@@ -969,6 +969,8 @@ def register_graph_buffers(fa: int, handles: List[str],
                            offsets: List[List[int]]) -> None:
     torch.ops._C_custom_ar.register_graph_buffers(fa, handles, offsets)
 
+def preload_to_l2cache(input: torch.Tensor, offset=0, ratio=1.0) -> None:
+    torch.ops._C.preload_to_l2cache(input, offset, ratio)
 
 # temporary fix for https://github.com/vllm-project/vllm/issues/5456
 # TODO: remove this in v0.6.0

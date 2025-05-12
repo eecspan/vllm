@@ -19,6 +19,7 @@ from vllm.model_executor.parameter import (BasevLLMParameter,
                                            PerTensorScaleParameter,
                                            RowvLLMParameter)
 from vllm.model_executor.utils import set_weight_attrs
+from vllm import _custom_ops as ops
 
 logger = init_logger(__name__)
 
@@ -979,7 +980,8 @@ class RowParallelLinear(LinearBase):
                  params_dtype: Optional[torch.dtype] = None,
                  reduce_results: bool = True,
                  quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 preload_stream = None):
         super().__init__(input_size, output_size, skip_bias_add, params_dtype,
                          quant_config, prefix)
 
@@ -1015,6 +1017,9 @@ class RowParallelLinear(LinearBase):
             })
         else:
             self.register_parameter("bias", None)
+        self.preload_stream = preload_stream
+        self.can_preload_event = torch.cuda.Event(enable_timing=False)
+        self.preload_sync_event = torch.cuda.Event(enable_timing=False)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         tp_rank = get_tensor_model_parallel_rank()
@@ -1063,7 +1068,8 @@ class RowParallelLinear(LinearBase):
 
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_,
+                preload_weight=None):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1080,6 +1086,13 @@ class RowParallelLinear(LinearBase):
         output_parallel = self.quant_method.apply(self,
                                                   input_parallel,
                                                   bias=bias_)
+        if self.preload_stream is not None and preload_weight is not None:
+            self.can_preload_event.record()
+            with torch.cuda.stream(self.preload_stream):
+                self.preload_stream.wait_event(self.can_preload_event)
+                if self.reduce_results and self.tp_size > 1:
+                    ops.preload_to_l2cache(preload_weight, ratio=1.0)
+                self.preload_sync_event.record()
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:

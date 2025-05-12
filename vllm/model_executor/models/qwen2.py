@@ -50,7 +50,7 @@ from vllm.sequence import IntermediateTensors
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers)
-
+import vllm.envs as envs
 
 class Qwen2MLP(nn.Module):
 
@@ -60,6 +60,7 @@ class Qwen2MLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
+        preload_stream = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -69,16 +70,17 @@ class Qwen2MLP(nn.Module):
         self.down_proj = RowParallelLinear(intermediate_size,
                                            hidden_size,
                                            bias=False,
-                                           quant_config=quant_config)
+                                           quant_config=quant_config,
+                                           preload_stream=preload_stream)
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, preload_weight = None):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, preload_weight=preload_weight)
         return x
 
 
@@ -92,7 +94,8 @@ class Qwen2Attention(nn.Module):
                  rope_theta: float = 10000,
                  cache_config: Optional[CacheConfig] = None,
                  quant_config: Optional[QuantizationConfig] = None,
-                 rope_scaling: Optional[Tuple] = None) -> None:
+                 rope_scaling: Optional[Tuple] = None,
+                 preload_stream = None) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
@@ -128,6 +131,7 @@ class Qwen2Attention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            preload_stream=preload_stream,
         )
 
         self.rotary_emb = get_rope(
@@ -150,12 +154,14 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        preload_weight = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output,
+                                preload_weight=preload_weight)
         return output
 
 
@@ -166,6 +172,7 @@ class Qwen2DecoderLayer(nn.Module):
         config: Qwen2Config,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        preload_stream = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -180,17 +187,20 @@ class Qwen2DecoderLayer(nn.Module):
             rope_theta=rope_theta,
             cache_config=cache_config,
             quant_config=quant_config,
-            rope_scaling=rope_scaling)
+            rope_scaling=rope_scaling,
+            preload_stream=preload_stream)
         self.mlp = Qwen2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
+            preload_stream=preload_stream,
         )
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+        self.next_layer_qkv_weight = None
 
     def forward(
         self,
@@ -207,17 +217,34 @@ class Qwen2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+        need_preload_weight = None
+        if hasattr(self.mlp.gate_up_proj, "weight"):
+            need_preload_weight = self.mlp.gate_up_proj.weight
+        elif hasattr(self.mlp.gate_up_proj, "weight_packed"):
+            need_preload_weight = self.mlp.gate_up_proj.weight_packed
+        elif hasattr(self.mlp.gate_up_proj, "qweight"):
+            need_preload_weight = self.mlp.gate_up_proj.qweight
+        elif hasattr(self.mlp.gate_up_proj, "B"):
+            need_preload_weight = self.mlp.gate_up_proj.B
+        else:
+            raise ValueError(f"Unsupported preload weight layer: {self.mlp.gate_up_proj}")
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
+            preload_weight=need_preload_weight,
         )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        # wait preload finish before mlp
+        torch.cuda.current_stream().wait_event(self.self_attn.o_proj.preload_sync_event)
+        hidden_states = self.mlp(hidden_states, preload_weight=self.next_layer_qkv_weight)
+        
+        # wait preload finish before qkv
+        torch.cuda.current_stream().wait_event(self.mlp.down_proj.preload_sync_event)
         return hidden_states, residual
 
 
@@ -245,11 +272,14 @@ class Qwen2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        self.preload_stream = torch.cuda.Stream() if envs.VLLM_ENABLE_L2CACHE_PRELOAD else None
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Qwen2DecoderLayer(config=config,
                                              cache_config=cache_config,
-                                             quant_config=quant_config),
+                                             quant_config=quant_config,
+                                             preload_stream=self.preload_stream,),
             prefix=f"{prefix}.layers",
         )
 
@@ -285,6 +315,17 @@ class Qwen2Model(nn.Module):
             residual = intermediate_tensors["residual"]
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
+            if i != self.end_layer - 1:
+                if hasattr(self.layers[i + 1].self_attn.qkv_proj, "weight"):
+                    layer.next_layer_qkv_weight = self.layers[i + 1].self_attn.qkv_proj.weight
+                elif hasattr(self.layers[i + 1].self_attn.qkv_proj, "weight_packed"):
+                    layer.next_layer_qkv_weight = self.layers[i + 1].self_attn.qkv_proj.weight_packed
+                elif hasattr(self.layers[i + 1].self_attn.qkv_proj, "qweight"):
+                    layer.next_layer_qkv_weight = self.layers[i + 1].self_attn.qkv_proj.qweight
+                elif hasattr(self.layers[i + 1].self_attn.qkv_proj, "B"):
+                    layer.next_layer_qkv_weight = self.layers[i + 1].self_attn.qkv_proj.B
+                else:
+                    raise ValueError(f"Unsupported preload weight layer: {self.layers[i + 1].self_attn.qkv_proj}")
             hidden_states, residual = layer(
                 positions,
                 hidden_states,

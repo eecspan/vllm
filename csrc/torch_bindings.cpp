@@ -358,6 +358,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor!? azp) -> ()");
   ops.impl("dynamic_scaled_int8_quant", torch::kCUDA,
            &dynamic_scaled_int8_quant);
+  ops.def(
+      "preload_to_l2cache(Tensor input, int offset, float ratio) -> "
+      "()");
+  ops.impl("preload_to_l2cache", torch::kCUDA,
+           &preload_to_l2cache);
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
