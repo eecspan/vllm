@@ -7,6 +7,7 @@
 #define LOOP_SIZE 1024
 #define L2_CACHE_LINE 1
 
+
 namespace vllm {
     __global__ void l2_preload_kernel(char* ptr, int loop_size, int count) {
     #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
