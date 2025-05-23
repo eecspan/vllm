@@ -190,11 +190,11 @@ tokenizer.pad_token = tokenizer.eos_token
 # seq_lens = [140, 128, 2048, 2048]
 # output_lens = [330, 2048, 128, 2048]
 batch_sizes = [1]
-seq_lens = [128]
-output_lens = [1024]
+seq_lens = [4096]
+output_lens = [4]
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
 # llm = LLM(model=model_pth, trust_remote_code=True, tensor_parallel_size=4, quantization="AWQ", dtype='float16')  # Name or path of your model
-llm = LLM(model=model_pth, trust_remote_code=True, tensor_parallel_size=4)  # Name or path of your model
+llm = LLM(model=model_pth, trust_remote_code=True, tensor_parallel_size=4, enable_chunked_prefill=False, enforce_eager=False)  # Name or path of your model
 sampling_params = SamplingParams(
     temperature = 0.9,
     max_tokens = 100,
@@ -210,17 +210,15 @@ for i in range(len(batch_sizes)):
 
     sampling_params.max_tokens = output_len
     print(sampling_params.max_tokens)
-
+    print("start inference\n\n")
     # 这里可以选择输入任何内容，只要能作为有效的 token 化输入
-    dummy_input = ''' You are a highly advanced AI storyteller, designed to generate an endless stream of compelling narratives. Your task is to write an epic fantasy novel titled The Chronicles of Eldoria, which spans across multiple volumes. This story must be deeply immersive, richly detailed, and continuously unfolding without stopping. Your goal is to provide an engaging, coherent, and intricate story that never ceases to generate new content.Now, begin writing.
-'''
-    dummy_input = [dummy_input * 6] * batch_size  # 假设每个输入为空字符串
+    dummy_input = "You are a highly advanced AI storyteller, designed to generate an endless stream of compelling narratives. Your task is to write an epic fantasy novel titled The Chronicles of Eldoria, which spans across multiple volumes. This story must be deeply immersive, richly detailed, and continuously unfolding without stopping. Your goal is to provide an engaging, coherent, and intricate story that never ceases to generate new content.Now, begin writing."
+    dummy_input = [dummy_input * 50 for _ in range(batch_size)]  # 假设每个输入为空字符串
     batch_input_ids = tokenizer(dummy_input, padding=True, truncation=True, max_length=seq_len, return_tensors="pt")
     batch_inputs = tokenizer.batch_decode(batch_input_ids.input_ids, skip_special_tokens=True)
     print(f"输入长度为：{batch_input_ids.input_ids.shape}")
     start_time = time.time()  # 记录开始时间（单位：秒，精度较低）
-    for j in range(1):
-        outputs = llm.generate(batch_inputs, sampling_params)
+    outputs = llm.generate(batch_inputs, sampling_params)
     end_time = time.time()    # 记录结束时间
     elapsed_time = end_time - start_time
     print(f"Batchsize_input_output: {batch_size}_{seq_len}_{output_len}")
@@ -231,10 +229,3 @@ for i in range(len(batch_sizes)):
     print(f"output len is: {len(outputs[0].outputs[0].token_ids)}")
     if output_len != len(outputs[0].outputs[0].token_ids):
         print("出错了!")
-
-    # # Print the outputs.
-    # for output in outputs:
-    #     prompt = output.prompt
-    #     # print(len(output.outputs[0].token_ids))
-    #     generated_text = output.outputs[0].text
-    #     print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")

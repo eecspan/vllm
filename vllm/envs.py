@@ -66,7 +66,7 @@ if TYPE_CHECKING:
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_TORCH_COMPILE_LEVEL: int = 0
     VLLM_DISABLED_KERNELS: List[str] = []
-    VLLM_ENABLE_L2CACHE_PRELOAD: bool = False
+    VLLM_ENABLE_L2CACHE_PRELOAD: int = 0  # 0: no preload; 1: preload weight; 2:preload weight and kv cache
 
 
 def get_default_cache_root():
@@ -436,7 +436,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
         "VLLM_DISABLED_KERNELS"].split(","),
     
     "VLLM_ENABLE_L2CACHE_PRELOAD":
-    lambda: bool(int(os.getenv("VLLM_ENABLE_L2CACHE_PRELOAD", "0"))),
+    lambda: int(os.getenv("VLLM_ENABLE_L2CACHE_PRELOAD", "0")),
 }
 
 # end-env-vars-definition

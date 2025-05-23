@@ -359,10 +359,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("dynamic_scaled_int8_quant", torch::kCUDA,
            &dynamic_scaled_int8_quant);
   ops.def(
-      "preload_to_l2cache(Tensor input, int offset, float ratio) -> "
+      "preload_weight_to_l2cache(Tensor weight, int offset=0, float ratio=1.0) -> "
       "()");
-  ops.impl("preload_to_l2cache", torch::kCUDA,
-           &preload_to_l2cache);
+  ops.impl("preload_weight_to_l2cache", torch::kCUDA,
+           &preload_weight_to_l2cache);
+  ops.def(
+      "preload_weight_kvcache_to_l2cache(Tensor weight, Tensor kv_cache, Tensor kv_cache_tables, int offset=0, float ratio=1.0) -> "
+      "()");
+  ops.impl("preload_weight_kvcache_to_l2cache", torch::kCUDA,
+           &preload_weight_kvcache_to_l2cache);
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {

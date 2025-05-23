@@ -30,7 +30,7 @@ from transformers import Qwen2Config
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, LoRAConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
@@ -77,10 +77,19 @@ class Qwen2MLP(nn.Module):
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, preload_weight = None):
+    def forward(self, x, preload_weight = None, preload_kv_cache = None, preload_kv_cache_tables = None):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x, preload_weight=preload_weight)
+        x, _ = self.down_proj(x, preload_weight=preload_weight, preload_kv_cache=preload_kv_cache, preload_kv_cache_tables=preload_kv_cache_tables)
+        # if (get_tensor_model_parallel_rank() == 0):
+        #     if preload_weight is None:
+        #         print("MLP down_proj No preload weight")
+        #     else:
+        #         print("MLP down_proj preload weight")
+        #     if preload_kv_cache is None or preload_kv_cache_tables is None:
+        #         print("MLP down_proj No preload kv cache")
+        #     else:
+        #         print("MLP down_proj preload kv cache")
         return x
 
 
@@ -162,6 +171,11 @@ class Qwen2Attention(nn.Module):
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output,
                                 preload_weight=preload_weight)
+        # if (get_tensor_model_parallel_rank() == 0):
+        #     if preload_weight is None:
+        #         print("attention o_proj No preload weight")
+        #     else:
+        #         print("attention o_proj preload weight")
         return output
 
 
@@ -188,7 +202,7 @@ class Qwen2DecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             rope_scaling=rope_scaling,
-            preload_stream=preload_stream)
+            preload_stream=preload_stream,)
         self.mlp = Qwen2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -200,7 +214,10 @@ class Qwen2DecoderLayer(nn.Module):
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+        self.need_l2cache_preload = 0
         self.next_layer_qkv_weight = None
+        self.next_layer_kv_cache = None
+        self.next_layer_kv_cache_tables = None
 
     def forward(
         self,
@@ -217,34 +234,38 @@ class Qwen2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
-        need_preload_weight = None
-        if hasattr(self.mlp.gate_up_proj, "weight"):
-            need_preload_weight = self.mlp.gate_up_proj.weight
-        elif hasattr(self.mlp.gate_up_proj, "weight_packed"):
-            need_preload_weight = self.mlp.gate_up_proj.weight_packed
-        elif hasattr(self.mlp.gate_up_proj, "qweight"):
-            need_preload_weight = self.mlp.gate_up_proj.qweight
-        elif hasattr(self.mlp.gate_up_proj, "B"):
-            need_preload_weight = self.mlp.gate_up_proj.B
-        else:
-            raise ValueError(f"Unsupported preload weight layer: {self.mlp.gate_up_proj}")
+        _preload_weight = None
+        # only decode preload weight
+        if self.need_l2cache_preload > 0:
+            if hasattr(self.mlp.gate_up_proj, "weight"):
+                _preload_weight = self.mlp.gate_up_proj.weight
+            elif hasattr(self.mlp.gate_up_proj, "weight_packed"):
+                _preload_weight = self.mlp.gate_up_proj.weight_packed
+            elif hasattr(self.mlp.gate_up_proj, "qweight"):
+                _preload_weight = self.mlp.gate_up_proj.qweight
+            elif hasattr(self.mlp.gate_up_proj, "B"):
+                _preload_weight = self.mlp.gate_up_proj.B
+            else:
+                raise ValueError(f"Unsupported preload weight layer: {self.mlp.gate_up_proj}")
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
-            preload_weight=need_preload_weight,
+            preload_weight=_preload_weight,
         )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        # wait preload finish before mlp
-        torch.cuda.current_stream().wait_event(self.self_attn.o_proj.preload_sync_event)
-        hidden_states = self.mlp(hidden_states, preload_weight=self.next_layer_qkv_weight)
-        
-        # wait preload finish before qkv
-        torch.cuda.current_stream().wait_event(self.mlp.down_proj.preload_sync_event)
+
+        # only decode preload weight
+        if self.need_l2cache_preload == 0:
+            hidden_states = self.mlp(hidden_states)
+        else:
+            torch.cuda.current_stream().wait_event(self.self_attn.o_proj.preload_sync_event)
+            hidden_states = self.mlp(hidden_states, preload_weight=self.next_layer_qkv_weight, preload_kv_cache=self.next_layer_kv_cache, preload_kv_cache_tables=self.next_layer_kv_cache_tables)
+            torch.cuda.current_stream().wait_event(self.mlp.down_proj.preload_sync_event)
         return hidden_states, residual
 
 
@@ -272,7 +293,8 @@ class Qwen2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.preload_stream = torch.cuda.Stream() if envs.VLLM_ENABLE_L2CACHE_PRELOAD else None
+        self.preload_stream = torch.cuda.Stream() if envs.VLLM_ENABLE_L2CACHE_PRELOAD > 0 else None
+        self.need_l2cache_preload = envs.VLLM_ENABLE_L2CACHE_PRELOAD # 0: no preload; 1: only preload weight; 2: preload weight and kv cache
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -313,26 +335,80 @@ class Qwen2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            if i != self.end_layer - 1:
-                if hasattr(self.layers[i + 1].self_attn.qkv_proj, "weight"):
-                    layer.next_layer_qkv_weight = self.layers[i + 1].self_attn.qkv_proj.weight
-                elif hasattr(self.layers[i + 1].self_attn.qkv_proj, "weight_packed"):
-                    layer.next_layer_qkv_weight = self.layers[i + 1].self_attn.qkv_proj.weight_packed
-                elif hasattr(self.layers[i + 1].self_attn.qkv_proj, "qweight"):
-                    layer.next_layer_qkv_weight = self.layers[i + 1].self_attn.qkv_proj.qweight
-                elif hasattr(self.layers[i + 1].self_attn.qkv_proj, "B"):
-                    layer.next_layer_qkv_weight = self.layers[i + 1].self_attn.qkv_proj.B
+        # only decode phase need preload
+        if attn_metadata.num_decode_tokens > 0:
+            for i in range(self.start_layer, self.end_layer):
+                # if (get_tensor_model_parallel_rank() == 0):
+                #     print(f"layer_{i} is forwarding...")
+                #     print(hidden_states.shape)
+                layer = self.layers[i]
+                layer.need_l2cache_preload = self.need_l2cache_preload
+                # all layer share the same block_table
+                if self.need_l2cache_preload == 2:
+                    layer.next_layer_kv_cache_tables = attn_metadata.decode_metadata.block_tables
                 else:
-                    raise ValueError(f"Unsupported preload weight layer: {self.layers[i + 1].self_attn.qkv_proj}")
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                kv_caches[i - self.start_layer],
-                attn_metadata,
-                residual,
-            )
+                    layer.next_layer_kv_cache_tables = None
+                if self.need_l2cache_preload > 0:
+                    if i != self.end_layer - 1:
+                        if hasattr(self.layers[i + 1 - self.start_layer].self_attn.qkv_proj, "weight"):
+                            layer.next_layer_qkv_weight = self.layers[i + 1 - self.start_layer].self_attn.qkv_proj.weight
+                        elif hasattr(self.layers[i + 1 - self.start_layer].self_attn.qkv_proj, "weight_packed"):
+                            layer.next_layer_qkv_weight = self.layers[i + 1 - self.start_layer].self_attn.qkv_proj.weight_packed
+                        elif hasattr(self.layers[i + 1 - self.start_layer].self_attn.qkv_proj, "qweight"):
+                            layer.next_layer_qkv_weight = self.layers[i + 1 - self.start_layer].self_attn.qkv_proj.qweight
+                        elif hasattr(self.layers[i + 1 - self.start_layer].self_attn.qkv_proj, "B"):
+                            layer.next_layer_qkv_weight = self.layers[i + 1 - self.start_layer].self_attn.qkv_proj.B
+                        else:
+                            raise ValueError(f"Unsupported preload weight layer: {self.layers[i + 1 - self.start_layer].self_attn.qkv_proj}")
+                        if self.need_l2cache_preload == 2:
+                            layer.next_layer_kv_cache = kv_caches[i + 1 - self.start_layer]
+                        else:
+                            layer.next_layer_kv_cache = None
+                    else:
+                        if hasattr(self.layers[self.start_layer].self_attn.qkv_proj, "weight"):
+                            layer.next_layer_qkv_weight = self.layers[self.start_layer].self_attn.qkv_proj.weight
+                        elif hasattr(self.layers[self.start_layer].self_attn.qkv_proj, "weight_packed"):
+                            layer.next_layer_qkv_weight = self.layers[self.start_layer].self_attn.qkv_proj.weight_packed
+                        elif hasattr(self.layers[self.start_layer].self_attn.qkv_proj, "qweight"):
+                            layer.next_layer_qkv_weight = self.layers[self.start_layer].self_attn.qkv_proj.qweight
+                        elif hasattr(self.layers[self.start_layer].self_attn.qkv_proj, "B"):
+                            layer.next_layer_qkv_weight = self.layers[self.start_layer].self_attn.qkv_proj.B
+                        else:
+                            raise ValueError(f"Unsupported preload weight layer: {self.layers[self.start_layer].self_attn.qkv_proj}")
+                        if self.need_l2cache_preload == 2:
+                            layer.next_layer_kv_cache = kv_caches[self.start_layer]
+                        else:
+                            layer.next_layer_kv_cache = None
+                # if (get_tensor_model_parallel_rank() == 0):
+                #     print(f"CPU: preload_kv_cache = {hex(layer.next_layer_kv_cache.data_ptr())}, preload_kv_cache_tables = {hex(layer.next_layer_kv_cache_tables.data_ptr())}")
+                #     print(f"kv_stride: {layer.next_layer_kv_cache[1].data_ptr() - layer.next_layer_kv_cache[0].data_ptr()}")
+                #     print(f"kv_cache is_contiguous = {layer.next_layer_kv_cache.is_contiguous()}")
+                    # print(layer.next_layer_kv_cache.shape)
+                #     print(layer.next_layer_kv_cache_tables)
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    kv_caches[i - self.start_layer],
+                    attn_metadata,
+                    residual,
+                )
+        else:
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                layer.need_l2cache_preload = 0
+                layer.next_layer_qkv_weight = None
+                layer.next_layer_kv_cache = None
+                layer.next_layer_kv_cache_tables = None
+                # if (get_tensor_model_parallel_rank() == 0):
+                #     print(f"layer_{i} is forwarding...")
+                #     print(hidden_states.shape)
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    kv_caches[i - self.start_layer],
+                    attn_metadata,
+                    residual,
+                )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,

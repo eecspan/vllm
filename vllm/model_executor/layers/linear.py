@@ -1069,7 +1069,7 @@ class RowParallelLinear(LinearBase):
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(self, input_,
-                preload_weight=None):
+                preload_weight=None, preload_kv_cache=None, preload_kv_cache_tables=None):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1091,7 +1091,10 @@ class RowParallelLinear(LinearBase):
             with torch.cuda.stream(self.preload_stream):
                 self.preload_stream.wait_event(self.can_preload_event)
                 if self.reduce_results and self.tp_size > 1:
-                    ops.preload_to_l2cache(preload_weight, ratio=1.0)
+                    if preload_kv_cache is not None and preload_kv_cache_tables is not None:
+                        ops.preload_weight_kvcache_to_l2cache(preload_weight, kv_cache=preload_kv_cache, kv_cache_tables=preload_kv_cache_tables, ratio=1.0)
+                    else:
+                        ops.preload_weight_to_l2cache(preload_weight, ratio=1.0)
                 self.preload_sync_event.record()
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
