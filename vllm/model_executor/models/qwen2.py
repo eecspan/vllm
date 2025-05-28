@@ -295,6 +295,7 @@ class Qwen2Model(nn.Module):
 
         self.preload_stream = torch.cuda.Stream() if envs.VLLM_ENABLE_L2CACHE_PRELOAD > 0 else None
         self.need_l2cache_preload = envs.VLLM_ENABLE_L2CACHE_PRELOAD # 0: no preload; 1: only preload weight; 2: preload weight and kv cache
+        self.need_prefill_preload = 1
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -392,23 +393,65 @@ class Qwen2Model(nn.Module):
                     attn_metadata,
                     residual,
                 )
+        # prefill phase
         else:
-            for i in range(self.start_layer, self.end_layer):
-                layer = self.layers[i]
-                layer.need_l2cache_preload = 0
-                layer.next_layer_qkv_weight = None
-                layer.next_layer_kv_cache = None
-                layer.next_layer_kv_cache_tables = None
-                # if (get_tensor_model_parallel_rank() == 0):
-                #     print(f"layer_{i} is forwarding...")
-                #     print(hidden_states.shape)
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    kv_caches[i - self.start_layer],
-                    attn_metadata,
-                    residual,
-                )
+            # need preload weight in prefill
+            if self.need_l2cache_preload > 0 and self.need_prefill_preload == 1:
+                for i in range(self.start_layer, self.end_layer):
+                    # if (get_tensor_model_parallel_rank() == 0):
+                    #     print(f"layer_{i} is forwarding...")
+                    #     print(hidden_states.shape)
+                    layer = self.layers[i]
+                    layer.next_layer_kv_cache = None
+                    layer.next_layer_kv_cache_tables = None
+                    layer.need_l2cache_preload = 1
+                    if i != self.end_layer - 1:
+                        if hasattr(self.layers[i + 1 - self.start_layer].self_attn.qkv_proj, "weight"):
+                            layer.next_layer_qkv_weight = self.layers[i + 1 - self.start_layer].self_attn.qkv_proj.weight
+                        elif hasattr(self.layers[i + 1 - self.start_layer].self_attn.qkv_proj, "weight_packed"):
+                            layer.next_layer_qkv_weight = self.layers[i + 1 - self.start_layer].self_attn.qkv_proj.weight_packed
+                        elif hasattr(self.layers[i + 1 - self.start_layer].self_attn.qkv_proj, "qweight"):
+                            layer.next_layer_qkv_weight = self.layers[i + 1 - self.start_layer].self_attn.qkv_proj.qweight
+                        elif hasattr(self.layers[i + 1 - self.start_layer].self_attn.qkv_proj, "B"):
+                            layer.next_layer_qkv_weight = self.layers[i + 1 - self.start_layer].self_attn.qkv_proj.B
+                        else:
+                            raise ValueError(f"Unsupported preload weight layer: {self.layers[i + 1 - self.start_layer].self_attn.qkv_proj}")
+                    else:
+                        if hasattr(self.layers[self.start_layer].self_attn.qkv_proj, "weight"):
+                            layer.next_layer_qkv_weight = self.layers[self.start_layer].self_attn.qkv_proj.weight
+                        elif hasattr(self.layers[self.start_layer].self_attn.qkv_proj, "weight_packed"):
+                            layer.next_layer_qkv_weight = self.layers[self.start_layer].self_attn.qkv_proj.weight_packed
+                        elif hasattr(self.layers[self.start_layer].self_attn.qkv_proj, "qweight"):
+                            layer.next_layer_qkv_weight = self.layers[self.start_layer].self_attn.qkv_proj.qweight
+                        elif hasattr(self.layers[self.start_layer].self_attn.qkv_proj, "B"):
+                            layer.next_layer_qkv_weight = self.layers[self.start_layer].self_attn.qkv_proj.B
+                        else:
+                            raise ValueError(f"Unsupported preload weight layer: {self.layers[self.start_layer].self_attn.qkv_proj}")
+                    hidden_states, residual = layer(
+                        positions,
+                        hidden_states,
+                        kv_caches[i - self.start_layer],
+                        attn_metadata,
+                        residual,
+                    )
+            # no preload for prefill
+            else:
+                for i in range(self.start_layer, self.end_layer):
+                    layer = self.layers[i]
+                    layer.need_l2cache_preload = 0
+                    layer.next_layer_qkv_weight = None
+                    layer.next_layer_kv_cache = None
+                    layer.next_layer_kv_cache_tables = None
+                    # if (get_tensor_model_parallel_rank() == 0):
+                    #     print(f"layer_{i} is forwarding...")
+                    #     print(hidden_states.shape)
+                    hidden_states, residual = layer(
+                        positions,
+                        hidden_states,
+                        kv_caches[i - self.start_layer],
+                        attn_metadata,
+                        residual,
+                    )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
